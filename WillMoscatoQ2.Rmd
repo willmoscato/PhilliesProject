@@ -197,7 +197,7 @@ new_obs_1 <- batting_testing %>% filter(Name == "Rougned Odor")
 Odor <- predict_parts(explainer = knn_batting_explain,
                           new_observation = new_obs_1,
                           type = "break_down") #default
-Odor_pp <- plot(Odor, title = "David Freese Prediction") + theme(plot.title = element_text(hjust = .5, size = 15, color = "black", face = "bold"))
+Odor_pp <- plot(Odor, title = "Rougned Odor Prediction") + theme(plot.title = element_text(hjust = .5, size = 15, color = "black", face = "bold"))
 
 Odor_pp
 ```
