@@ -1,8 +1,11 @@
 ---
 title: "Phillies Question 2"
-author: "Will Moscato"
 date: "2022-08-18"
-output: html_document
+output:
+  html_document: 
+    toc: true
+    toc_float: true
+    theme: united
 ---
 
 ```{r setup, include=FALSE}
