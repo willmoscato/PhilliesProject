@@ -1,0 +1,370 @@
+---
+title: "OBP Predictor"
+author: "Will Moscato"
+date: "2022-08-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(readr)
+library(broom)
+library(ggplot2)
+library(tidymodels) 
+library(vip)
+library(stacks)
+library(DALEX)
+library(DALEXtra)
+library(themis)
+library(pitchRx)
+library(kableExtra)
+library(webshot)
+library(magick)
+library(viridis)
+set.seed(666)
+tidymodels_prefer()
+
+
+theme_set(theme_minimal())
+```
+
+
+```{r}
+batting <- read_csv("batting.csv")
+
+batting <- batting %>% 
+  mutate(across(ends_with("%"), ~gsub("\\%", "", .)))
+  
+
+batting$`MarApr_HR/FB` = gsub("\\%", "", batting$`MarApr_HR/FB`)
+  
+batting <- batting %>% 
+  mutate(across(ends_with("%"), ~as.numeric(.))) %>% 
+  mutate(`MarApr_HR/FB` = as.numeric(`MarApr_HR/FB`))
+
+battingsplit <- initial_split(batting, strata = "FullSeason_OBP")
+batting_train <- training(battingsplit)
+batting_testing <- testing(battingsplit)
+
+
+batting_train <- batting %>% 
+  select(-playerid, -Name, -Team)
+```
+
+```{r}
+batting %>% 
+  ggplot(aes(x = MarApr_OBP, y = FullSeason_OBP)) +
+  geom_point()
+```
+
+```{r}
+batting %>% 
+  ggplot(aes(x = `MarApr_Swing%`, y = FullSeason_OBP)) +
+  geom_point()
+```
+
+
+```{r}
+rmse(batting, truth = FullSeason_OBP, estimate = MarApr_OBP)
+```
+
+
+
+
+```{r}
+lm_lasso_spec <- 
+  linear_reg() %>%
+  set_args(mixture = 1, penalty = 0) %>% 
+  set_engine(engine = 'glmnet') %>% 
+  set_mode('regression') 
+
+
+batting_rec <- recipe(FullSeason_OBP ~ ., data = batting_train) %>%
+    step_nzv(all_predictors()) %>% 
+    step_novel(all_nominal_predictors()) %>% 
+    step_normalize(all_numeric_predictors()) %>%  
+    step_dummy(all_nominal_predictors())
+
+# Workflow (Recipe + Model)
+batting_lasso_wf <- workflow() %>% 
+  add_recipe(batting_rec) %>%
+  add_model(lm_lasso_spec)
+
+# Fit Model
+batting_lasso_fit <- batting_lasso_wf %>% 
+  fit(data = batting_train) 
+```
+
+```{r}
+plot(batting_lasso_fit %>% extract_fit_parsnip() %>% pluck('fit'), 
+     xvar = "lambda")
+```
+
+```{r}
+# Create CV folds
+data_cv10 <- vfold_cv(batting_train, v = 10)
+
+# Lasso Model Spec with tune
+lm_lasso_spec_tune <- 
+  linear_reg() %>%
+  set_args(mixture = 1, penalty = tune()) %>% 
+  set_engine(engine = 'glmnet') %>%
+  set_mode('regression') 
+
+# Workflow 
+batting_lasso_wf_tune <- workflow() %>% 
+  add_recipe(batting_rec) %>%
+  add_model(lm_lasso_spec_tune) 
+
+# Tune Model 
+penalty_grid <- grid_regular(
+  penalty(range = c(-5, 0)), 
+  levels = 30)
+
+batting_tune_res <- tune_grid(
+  batting_lasso_wf_tune, 
+  resamples = data_cv10, 
+  metrics = metric_set(rmse, mae),
+  grid = penalty_grid 
+)
+
+# Visualize Model Evaluation Metrics from Tuning
+autoplot(batting_tune_res) + theme_classic()
+
+# Summarize Model Evaluation Metrics (CV)
+collect_metrics(batting_tune_res) %>%
+  filter(.metric == 'rmse') %>% 
+  select(penalty, rmse = mean) 
+
+best_penalty <- select_best(batting_tune_res, metric = 'rmse') 
+
+# Fit Final Model
+batting_final_wf <- finalize_workflow(batting_lasso_wf_tune, best_penalty) # incorporates penalty value to workflow
+
+batting_final_fit <- fit(batting_final_wf, data = batting_train)
+
+tidy(batting_final_fit)
+```
+
+```{r}
+pred <- predict(batting_final_fit, new_data = batting_testing)
+
+batting_test_lasso <- cbind(batting_testing, pred)
+batting_testing_lasso <- batting_test_lasso %>% 
+  select(Name, FullSeason_OBP, .pred)
+
+rmse(batting_testing_lasso, truth = FullSeason_OBP, estimate = .pred)
+```
+
+```{r}
+lasso_fit <- last_fit(batting_final_fit, battingsplit)
+collect_metrics(lasso_fit)
+```
+
+
+```{r}
+batting_lasso_explain <- 
+  explain_tidymodels(
+    model = batting_final_fit,
+    data = batting_train %>% select(-FullSeason_OBP), 
+    y = as.numeric(batting_train$FullSeason_OBP),
+    label = "lasso"
+  )
+```
+
+```{r}
+batting_var_imp <- 
+  model_parts(
+    batting_lasso_explain
+    )
+
+plot(batting_var_imp)
+```
+
+```{r}
+# Model Specification
+knn_spec <- 
+  nearest_neighbor() %>% # new type of model!
+  set_args(neighbors = tune()) %>% # tuning parameter is neighbor; tuning spec
+  set_engine(engine = 'kknn') %>% # new engine
+  set_mode('regression') 
+
+# Recipe with standardization (!)
+knn_batting_rec <- recipe(FullSeason_OBP ~ . , data = batting_train) %>%
+    step_nzv(all_predictors()) %>% # removes variables with the same value
+    step_rm(MarApr_SB, MarApr_R) %>% 
+    step_novel(all_nominal_predictors()) %>% # important if you have rare categorical variables 
+    step_normalize(all_numeric_predictors()) %>%  # important standardization step for KNN
+    step_dummy(all_nominal_predictors())  # creates indicator variables for categorical variables (important for KNN!)
+
+# Workflow (Recipe + Model)
+knn_wf <- workflow() %>%
+  add_model(knn_spec) %>% 
+  add_recipe(knn_batting_rec)
+
+# Tune model trying a variety of values for neighbors (using 10-fold CV)
+knn_penalty_grid <- grid_regular(
+  neighbors(range = c(1, 25)), #  min and max of values for neighbors
+  levels = 25) # number of neighbors values
+
+knn_fit_cv <- tune_grid(knn_wf, # workflow
+              resamples = data_cv10, #CV folds
+              grid = knn_penalty_grid, # grid specified above
+              metrics = metric_set(rmse, mae))
+```
+
+```{r}
+knn_fit_cv %>% autoplot() # Visualize Trained Model using CV
+
+knn_fit_cv %>% show_best(metric = 'rmse') # Show evaluation metrics for different values of neighbors, ordered
+
+# Choose value of Tuning Parameter (neighbors)
+tuned_knn_wf <- knn_fit_cv %>% 
+  select_by_one_std_err(metric = 'rmse',desc(neighbors)) %>%  # Choose neighbors value that leads to the highest neighbors within 1 se of the lowest CV MAE
+  finalize_workflow(knn_wf, .)
+
+# Fit final KNN model to data
+knn_fit_final <- tuned_knn_wf %>%
+  fit(data = batting_train) 
+
+```
+
+```{r}
+
+# Use the best model to make predictions
+# new_data should be a data.frame with required predictors
+pred <- predict(knn_fit_final, new_data = batting_testing)
+
+batting_knn_testing <- cbind(batting_testing, pred)
+batting_knn_testing <- batting_knn_testing %>% 
+  select(Name, Team, FullSeason_OBP, .pred)
+
+rmse(batting_knn_testing, truth = FullSeason_OBP, estimate = .pred)
+```
+
+
+```{r}
+knn_fit <- last_fit(knn_fit_final, battingsplit)
+collect_metrics(knn_fit)
+```
+
+```{r}
+knn_batting_lasso_explain <- 
+  explain_tidymodels(
+    model = knn_fit_final,
+    data = batting_train %>% select(-FullSeason_OBP), 
+    y = as.numeric(batting_train$FullSeason_OBP),
+    label = "lasso"
+  )
+```
+
+```{r}
+knn_batting_var_imp <- 
+  model_parts(
+    knn_batting_lasso_explain
+    )
+
+plot(knn_batting_var_imp)
+```
+
+```{r}
+batting_ranger_recipe <- recipe(FullSeason_OBP ~., data = batting_train) %>% 
+  step_rm(MarApr_R, MarApr_SB)
+
+batting_ranger_recipe %>% 
+  prep(batting_train) %>% 
+  juice()
+```
+
+
+```{r}
+batting_ranger <- rand_forest(mtry = tune(), 
+              min_n = tune(), 
+              trees = 50) %>% 
+  set_mode("regression") %>% 
+  set_engine("ranger")
+
+batting_ranger_wf <- 
+  workflow() %>% 
+  add_recipe(batting_ranger_recipe) %>% 
+  add_model(batting_ranger) 
+
+batting_ranger_wf
+```
+
+
+```{r}
+batting_rf_grid <- grid_regular(min_n(), finalize(mtry(), batting_train %>% select(-FullSeason_OBP)), levels = 3)
+
+ctrl_res <- control_stack_grid()
+
+batting_ranger_cv <- batting_ranger_wf %>% 
+  tune_grid(resamples = data_cv10,
+           grid = batting_rf_grid,
+           control = ctrl_res)
+
+collect_metrics(batting_ranger_cv)
+```
+
+
+```{r}
+batting_best1 <- batting_ranger_cv %>% 
+  select_best(metric = "rmse")
+
+batting_ranger_final_wf<- batting_ranger_wf %>% 
+  finalize_workflow(batting_best1)
+```
+
+```{r}
+batting_ranger_fit <- batting_ranger_final_wf %>% 
+  fit(batting_train)
+
+
+batting_rf_explain <- 
+  explain_tidymodels(
+    model = batting_ranger_fit,
+    data = batting_train %>% select(-FullSeason_OBP), 
+    y = as.numeric(batting_train$FullSeason_OBP),
+    label = "rf"
+  )
+```
+
+```{r}
+batting_rf_var_imp <- 
+  model_parts(
+    batting_rf_explain
+    )
+
+plot(batting_rf_var_imp)
+```
+
+
+
+
+
+```{r}
+batting_ranger_test <- batting_ranger_final_wf %>% 
+  last_fit(battingsplit)
+
+batting_ranger_test %>% 
+  collect_metrics()
+```
+
+
+```{r}
+batting_ranger_testing <- batting_testing %>% 
+  bind_cols(predict(batting_ranger_fit, new_data = batting_testing)) %>% 
+  select(Name, Team, FullSeason_OBP, .pred)
+```
+
+```{r}
+rmse(batting_ranger_testing, truth = FullSeason_OBP, estimate = .pred)
+```
+
+
+

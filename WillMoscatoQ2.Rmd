@@ -1,0 +1,207 @@
+---
+title: "Phillies Question 2"
+author: "Will Moscato"
+date: "2022-08-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, warning = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(readr)
+library(broom)
+library(ggplot2)
+library(tidymodels) 
+library(vip)
+library(stacks)
+library(DALEX)
+library(DALEXtra)
+library(themis)
+library(pitchRx)
+library(kableExtra)
+library(webshot)
+library(magick)
+library(viridis)
+set.seed(666)
+tidymodels_prefer()
+
+
+theme_set(theme_minimal())
+```
+
+# Introduction 
+ 
+In this project I was asked to predicted the end of the season OBP based upon the players March and April hitting stats. I created this prediction by making a KNN machine learning model (reasons for chosing this model will be explained later), and the prediction was fairly accurate. 
+
+# Data
+
+The first thing that I had to do was load in and clean the data. I got rid of the % signs at the end of all the percentage stats and made them into numeric classes. This allows the model to treat them as numbers and gives us much better results. I then split the data set into a training and testing set in order for me to be able to test my results later on. Lastly, I removed any identifiers of the player from the training set to remove any chance of bias.
+
+
+```{r}
+batting <- read_csv("batting.csv")
+
+batting <- batting %>% 
+  mutate(across(ends_with("%"), ~gsub("\\%", "", .)))
+  
+
+batting$`MarApr_HR/FB` = gsub("\\%", "", batting$`MarApr_HR/FB`)
+  
+batting <- batting %>% 
+  mutate(across(ends_with("%"), ~as.numeric(.))) %>% 
+  mutate(`MarApr_HR/FB` = as.numeric(`MarApr_HR/FB`))
+
+battingsplit <- initial_split(batting, strata = "FullSeason_OBP")
+batting_train <- training(battingsplit)
+batting_testing <- testing(battingsplit)
+
+
+batting_train <- batting %>% 
+  select(-playerid, -Name, -Team)
+```
+
+# Exploratory
+
+Before I started doing any modeling I wanted to see how well the player's OBP in March and April predicted the end of season OBP. As it turns out, it does a fairly good job, giving us an RMSE of ~0.047. This is expected, as we wouldn't expect a player's OBP to drastically change over the course of the season. However, I was sure we could do better.
+
+```{r}
+batting %>% 
+  ggplot(aes(x = MarApr_OBP, y = FullSeason_OBP)) +
+  geom_point()
+```
+
+
+```{r}
+OBP_to_OBP <- rmse(batting, truth = FullSeason_OBP, estimate = MarApr_OBP)
+
+kable(OBP_to_OBP, align = c(rep('c', 1)), col.names = c("Metric", "Estimator", "Estimate")) %>% 
+  row_spec(0) %>% 
+  kable_styling(full_width = T, bootstrap_options = "striped", font_size = 20) %>% 
+  add_header_above(c("RMSE of using March/April OBP as Predictor" = 3), background = "red", color = "white")
+```
+
+# Modeling
+
+In the modeling process I tried three different types of models: lasso, random forest, and knn. While they all gave very similar RMSE's, I decided to go with the knn for a few reasons. First, because KNN models are very accurate and are good when you have knowledge of the domain of what you are trying to predict. Second, the data set was not too large (and would never be that large) and thus the prediction will not be slow. And lastly, in this specific case, the variable importance of the knn made more sense making it seem like the prediction would do better on other data sets than the lasso (which had the best rmse).
+
+
+First I had to create the cross validation folds. Then, I specified that I would be using a knn model for regression and set the number of neighbors to tune so that I could try different values. Then, I created the recipe for the model in which I decided to remove stolen bases and runs as they do not have anything to do with hitting and thus have nothing to do with OBP. Next, I created the tune grid for how many neighbors the model should use and I set the range between 1 and 25 as I didn't want to overfit or have the prediction take too long. Lastly, I fit the tune grid to the workflow.
+
+```{r}
+data_cv10 <- vfold_cv(batting_train, v = 10) # cross-validation folds
+
+
+# Model Specification
+knn_spec <- 
+  nearest_neighbor() %>% 
+  set_args(neighbors = tune()) %>% 
+  set_engine(engine = 'kknn') %>% 
+  set_mode('regression') 
+
+# Recipe
+knn_batting_rec <- recipe(FullSeason_OBP ~ . , data = batting_train) %>%
+    step_nzv(all_predictors()) %>% # removes variables with the same value
+    step_rm(MarApr_SB, MarApr_R) %>% # remove stolen bases and runs as they don't have anything to do with obp
+    step_novel(all_nominal_predictors()) %>% # important if you have rare categorical variables 
+    step_normalize(all_numeric_predictors()) %>%  # standardization step
+    step_dummy(all_nominal_predictors())  # indicator variables for categorical variables
+
+# Workflow
+knn_wf <- workflow() %>%
+  add_model(knn_spec) %>% 
+  add_recipe(knn_batting_rec)
+
+# Tuning
+knn_tune_grid <- grid_regular(
+  neighbors(range = c(1, 25)), 
+  levels = 25) 
+
+knn_fit_cv <- tune_grid(knn_wf,
+              resamples = data_cv10, 
+              grid = knn_tune_grid, 
+              metrics = metric_set(rmse, mae))
+```
+
+
+Next, I plotted the rmse and mae of differnt neighbor values and showed the best on the rmse of the training data. We see that it is at 25 neighbors with and rmse of ~0.299. 
+
+```{r}
+knn_fit_cv %>% autoplot() # Visualize Trained Model using CV
+
+knn_fit_cv %>% show_best(metric = 'rmse') 
+
+```
+
+Then I choose neighbors value that leads to the highest neighbors within 1 standard error of the lowest CV MAE and we fit that to the training data.
+
+```{r}
+# Choose value of Tuning Paramete
+tuned_knn_wf <- knn_fit_cv %>% 
+  select_by_one_std_err(metric = 'rmse',desc(neighbors)) %>%
+  finalize_workflow(knn_wf, .)
+
+# Fit final KNN model to data
+knn_fit_final <- tuned_knn_wf %>%
+  fit(data = batting_train) 
+
+```
+
+Then I fit the model to the testing data to see how it preforms and to ensure that the model is reproducible.
+
+```{r}
+knn_fit <- last_fit(knn_fit_final, battingsplit)
+collect_metrics(knn_fit)
+```
+
+Then we create the prediction on the testing data and bind it to the data set so that we can see the prediction and the actual value side by side. 
+
+```{r}
+pred <- predict(knn_fit_final, new_data = batting_testing)
+
+batting_knn_testing <- cbind(batting_testing, pred)
+batting_knn_testing <- batting_knn_testing %>% 
+  select(Name, Team, FullSeason_OBP, .pred)
+
+head(batting_knn_testing)
+```
+
+Then I created an explainer of the model so that we can create a variable importance plot for the model. We see that the March/April OBP is the most important  followed by walk rate, out of zone contact rate, and strike out rate. These seem to make logical sense and are a large reason why I chose this model over the lasso model which barely used the March/April OBP.
+
+```{r}
+knn_batting_explain <- 
+  explain_tidymodels(
+    model = knn_fit_final,
+    data = batting_train %>% select(-FullSeason_OBP), 
+    y = as.numeric(batting_train$FullSeason_OBP),
+    label = "lasso"
+  )
+
+knn_batting_var_imp <- 
+  model_parts(
+    knn_batting_explain
+    )
+
+plot(knn_batting_var_imp)
+```
+
+Lastly, I created a visual to see how each variable was affecting the prediction for a specific player. I think that this give us a better idea of how the model is working as a whole.
+
+```{r}
+new_obs_1 <- batting_testing %>% filter(Name == "Rougned Odor")
+
+#Pulls together the data needed for the break-down plot
+Odor <- predict_parts(explainer = knn_batting_explain,
+                          new_observation = new_obs_1,
+                          type = "break_down") #default
+Odor_pp <- plot(Odor, title = "David Freese Prediction") + theme(plot.title = element_text(hjust = .5, size = 15, color = "black", face = "bold"))
+
+Odor_pp
+```
+
+# Conclusion
+
+In conclusion, I was able to create a model that got the prediction within ~30 points of the actual end of season OBP. I used a knn model due to the accuracy as well as the variables it was using that lead me to believe its predictions are more reproducible. While just using the OBP from March and April is fairly good, my prediction gets us ~17 points closer to the actual OBP. 
