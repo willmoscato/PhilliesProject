@@ -135,7 +135,7 @@ cv_fit <- knn_fit_cv %>% show_best(metric = 'rmse')
 kable(cv_fit, align = c(rep('c', 1)), col.names = c("Number of Neighbors", "Metric", "Estimator", "Estimate", "n", "Standard Error", "Model")) %>% 
   row_spec(0) %>% 
   kable_styling(full_width = T, bootstrap_options = "striped", font_size = 20) %>% 
-  add_header_above(c("RMSE of using March/April OBP as Predictor" = 7), background = "red", color = "white")
+  add_header_above(c("Best RMSE Values" = 7), background = "red", color = "white")
 ```
 
 Then I choose neighbors value that leads to the highest neighbors within 1 standard error of the lowest CV MAE and we fit that to the training data.
@@ -161,7 +161,7 @@ knn_fit_collection <- collect_metrics(knn_fit)
 kable(knn_fit_collection, align = c(rep('c', 1)), col.names = c("Metric", "Estimator", "Estimate", "Model")) %>% 
   row_spec(0) %>% 
   kable_styling(full_width = T, bootstrap_options = "striped", font_size = 20) %>% 
-  add_header_above(c("RMSE of using March/April OBP as Predictor" = 4), background = "red", color = "white")
+  add_header_above(c("RMSE of Best Model on Testing Data" = 4), background = "red", color = "white")
 ```
 
 Then we create the prediction on the testing data and bind it to the data set so that we can see the prediction and the actual value side by side. 
@@ -179,7 +179,7 @@ test_head <- head(batting_knn_testing)
 kable(test_head, align = c(rep('c', 1)), col.names = c("Name", "Team", "Full Season OBP", "Predicted OBP")) %>% 
   row_spec(0) %>% 
   kable_styling(full_width = T, bootstrap_options = "striped", font_size = 20) %>% 
-  add_header_above(c("RMSE of using March/April OBP as Predictor" = 4), background = "red", color = "white")
+  add_header_above(c("Predicted vs Actual OBP" = 4), background = "red", color = "white")
 ```
 
 Then I created an explainer of the model so that we can create a variable importance plot for the model. We see that the March/April OBP is the most important  followed by walk rate, out of zone contact rate, and strike out rate. These seem to make logical sense and are a large reason why I chose this model over the lasso model which barely used the March/April OBP.
